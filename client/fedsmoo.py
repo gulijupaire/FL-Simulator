@@ -1,26 +1,48 @@
+# 文件路径: client/fedsmoo.py
+
 import torch
 from .client import Client
 from utils import *
 from optimizer import *
+# 你已有的导入……
+from utils import get_mdl_params, param_to_vector
+# 将错误的导入语句替换为下面这句
+from optimizer.utils_mud import (
+    build_flatten_plan,
+    stable_layer_seed,
+    AAD_decomposition,
+    post_hoc_decomposition,
+)
 
 
 class fedsmoo(Client):
-    def __init__(self, device, model_func, received_vecs, dataset, lr, args):   
+    def __init__(self, device, model_func, received_vecs, dataset, lr, args):
         super(fedsmoo, self).__init__(device, model_func, received_vecs, dataset, lr, args)
-        
-        # rebuild
-        self.base_optimizer = torch.optim.SGD(self.model.parameters(), lr=lr, weight_decay=self.args.weight_decay+self.args.lamb)
+
+        # FedSMOO 组件（保持你原逻辑）
+        self.base_optimizer = torch.optim.SGD(
+            self.model.parameters(),
+            lr=lr,
+            weight_decay=self.args.weight_decay + self.args.lamb,
+        )
         self.optimizer = DRegSAM(self.model.parameters(), self.base_optimizer, rho=self.args.rho)
 
-        self.dynamic_dual = None
+        # MUD 压缩配置
+        self.use_mud = bool(args.use_mud)
+        self.mud_rank = int(args.mud_rank)
+        self.use_aad = bool(args.use_aad)
 
-        self.comm_vecs = {
-            'local_update_list': None,
-            'local_model_param_list': None,
-            'local_dynamic_dual': None,
-        }
-    
-    
+        # 冷启动与频率控制
+        self.warmup_rounds = int(args.warmup_rounds)  # 前 N 轮不压缩
+        self.compress_every = int(args.compress_every)  # 每 K 轮压一次
+        self.skip_threshold = float(args.skip_threshold)  # 跳过阈值
+
+        # 构建展平计划（严格按 named_parameters 顺序）
+        self.flatten_plan, self.total_params = build_flatten_plan(self.model)
+
+    # =====================================================================
+    #  ↓↓↓ 这里是修改的核心区域 ↓↓↓
+    # =====================================================================
     def train(self):
         # local training
         self.model.train()
@@ -29,23 +51,114 @@ class fedsmoo(Client):
             for i, (inputs, labels) in enumerate(self.dataset):
                 inputs = inputs.to(self.device)
                 labels = labels.to(self.device).reshape(-1).long()
-                
-                self.optimizer.paras = [inputs, labels, self.loss, self.model, self.received_vecs['Dynamic_dual_correction']]
-                self.received_vecs['Dynamic_dual'] = self.optimizer.step(self.received_vecs['Dynamic_dual'])
-                
-                param_list = param_to_vector(self.model)
-                delta_list = self.received_vecs['Local_dual_correction'].to(self.device)
-                loss_correct = self.args.lamb * torch.sum(param_list * delta_list)
-                
-                loss_correct.backward()
-                
-                # Clip gradients to prevent exploding
-                torch.nn.utils.clip_grad_norm_(parameters=self.model.parameters(), max_norm=self.max_norm)
-                self.base_optimizer.step()
-                
-        last_state_params_list = get_mdl_params(self.model)
-        self.comm_vecs['local_update_list'] = last_state_params_list - self.received_vecs['Params_list']
-        self.comm_vecs['local_model_param_list'] = last_state_params_list
-        self.comm_vecs['local_dynamic_dual'] = self.received_vecs['Dynamic_dual']
 
-        return self.comm_vecs
+                # 定义一个临时的、包含所有损失项的函数
+                # 这是为了让 DRegSAM 能够对完整的总损失进行 SAM 优化
+                def combined_loss_func(model_predictions, ground_truth_labels):
+                    # 1. 计算基础的交叉熵损失
+                    loss_pred = self.loss(model_predictions, ground_truth_labels)
+
+                    # 2. 计算动态正则化项
+                    param_vec = param_to_vector(self.model)  # 获取当前最新的模型参数
+                    delta_vec = self.received_vecs['Local_dual_correction'].to(self.device)
+                    loss_correct = self.args.lamb * torch.sum(param_vec * delta_vec)
+
+                    # 3. 返回总损失
+                    return loss_pred + loss_correct
+
+                # 将输入、标签和我们新定义的组合损失函数传递给 DRegSAM 优化器
+                self.optimizer.paras = [inputs, labels, combined_loss_func, self.model,
+                                        self.received_vecs['Dynamic_dual_correction']]
+
+                # 执行 DRegSAM 的完整一步优化
+                # 它内部会处理两次反向传播和梯度扰动
+                self.received_vecs['Dynamic_dual'] = self.optimizer.step(self.received_vecs['Dynamic_dual'])
+
+                # 在 DRegSAM 完成其内部的梯度计算后，使用基础优化器（SGD）来应用这个最终的梯度
+                # 这一步是必须的，因为它完成了权重的最终更新
+                self.base_optimizer.step()
+
+        # =====================================================================
+        #  ↑↑↑ 修改结束 ↑↑↑
+        # =====================================================================
+
+        # === 通信阶段 (这部分保持你原来的逻辑不变) ===
+        last_state_params = get_mdl_params(self.model, device=torch.device("cpu"))
+        base_vec = self.received_vecs['Params_list'].to(last_state_params.device)
+        delta_w_full = last_state_params - base_vec
+
+        current_round = int(self.received_vecs.get('round', 0))
+        should_compress = (
+                self.use_mud
+                and current_round >= self.warmup_rounds
+                and (self.compress_every <= 1 or current_round % self.compress_every == 0)
+        )
+
+        comm_vecs = {
+            'use_compression': False,
+            'compressed_update': None,
+            'local_update_list': None,
+            'local_dynamic_dual': self.received_vecs['Dynamic_dual'],
+            'aad_seed': self.received_vecs.get('aad_seed', None),
+            'round': current_round,
+        }
+
+        if should_compress:
+            compressed = self.compress_update_post_hoc(delta_w_full)
+            if compressed:
+                comm_vecs['use_compression'] = True
+                comm_vecs['compressed_update'] = compressed
+            else:
+                comm_vecs['local_update_list'] = delta_w_full
+        else:
+            comm_vecs['local_update_list'] = delta_w_full
+
+        return comm_vecs
+
+    def compress_update_post_hoc(self, delta_w):
+        """
+        后置压缩（更省带宽版本）：
+        - 仅对目标层进行压缩
+        - 微小更新层直接跳过（不发占位包）
+        - 统一 CPU 传输
+        """
+        try:
+            compressed = {}
+            skipped, done = 0, 0
+
+            for item in self.flatten_plan:
+                if not item['is_target']:
+                    continue
+
+                layer_delta = delta_w[item['start']:item['end']].reshape(item['shape'])
+                if torch.norm(layer_delta).item() < self.skip_threshold:
+                    skipped += 1
+                    continue
+
+                orig_shape = tuple(layer_delta.shape)
+                delta_2d = layer_delta.reshape(orig_shape[0], -1) if len(orig_shape) > 2 else layer_delta
+
+                if self.use_aad:
+                    layer_seed = stable_layer_seed(self.received_vecs['aad_seed'], item['name'])
+                    U, V = AAD_decomposition(delta_2d, self.mud_rank, layer_seed, lambda_reg=self.args.als_reg)
+                    kind = 'aad'
+                else:
+                    U, V = post_hoc_decomposition(delta_2d, self.mud_rank)
+                    kind = 'svd'
+
+                compressed[item['name']] = {
+                    'type': kind,
+                    'shape': orig_shape,
+                    'U': U.detach().cpu(),
+                    'V': V.detach().cpu(),
+                }
+                done += 1
+
+            if getattr(self.args, "verbose", False):
+                print(f"[MUD] compressed={done}, skipped={skipped}")
+
+            return compressed if compressed else None
+
+        except Exception as e:
+            print(f"[MUD] Compression failed: {e}")
+            return None

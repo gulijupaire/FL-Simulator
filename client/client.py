@@ -18,34 +18,34 @@ class Client():
         
         if self.received_vecs['Params_list'] is None:
             raise Exception("CommError: invalid vectors Params_list received")
-        self.model = set_client_from_params(device=self.device, model=self.model_func(), params=self.received_vecs['Params_list'])
+        self.model = self.model_func().to(self.device)
+        set_mdl_params(self.model, self.received_vecs['Params_list'])
 
-        
         self.loss = torch.nn.CrossEntropyLoss(reduction='mean')
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=lr, weight_decay=self.args.weight_decay)
         self.dataset = data.DataLoader(Dataset(dataset[0], dataset[1], train=True, dataset_name=self.args.dataset), batch_size=self.args.batchsize, shuffle=True)
         
         self.max_norm = 10
-    
+
     def train(self):
         # local training
         self.model.train()
-        
+
         for k in range(self.args.local_epochs):
             for i, (inputs, labels) in enumerate(self.dataset):
                 inputs = inputs.to(self.device)
                 labels = labels.to(self.device).reshape(-1).long()
-                
+
                 predictions = self.model(inputs)
                 loss = self.loss(predictions, labels)
-                
+
                 self.optimizer.zero_grad()
                 loss.backward()
-                
+
                 # Clip gradients to prevent exploding
-                torch.nn.utils.clip_grad_norm_(parameters=self.model.parameters(), max_norm=self.max_norm) 
+                torch.nn.utils.clip_grad_norm_(parameters=self.model.parameters(), max_norm=self.max_norm)
                 self.optimizer.step()
-                
+
         last_state_params_list = get_mdl_params(self.model)
         self.comm_vecs['local_update_list'] = last_state_params_list - self.received_vecs['Params_list']
         self.comm_vecs['local_model_param_list'] = last_state_params_list

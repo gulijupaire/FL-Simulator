@@ -51,6 +51,13 @@ class FedSMOO(Server):
         if self.args.use_mud and self.args.use_aad:
             self.comm_vecs['aad_seed'] = self.aad_seed
 
+        if self.args.use_mud:
+            self.comm_vecs['flatten_plan'] = self.flatten_plan
+            self.comm_vecs['total_params'] = self.total_params
+        else:
+            self.comm_vecs.pop('flatten_plan', None)
+            self.comm_vecs.pop('total_params', None)
+
     def global_update(self, selected_clients, Averaged_update, Averaged_model):
         # FedSMOO 的全局更新逻辑 (保持不变)
         Averaged_dynamic_dual = torch.mean(self.mu_params_list[selected_clients], dim=0)

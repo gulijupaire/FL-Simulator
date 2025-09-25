@@ -75,7 +75,7 @@ class Server(object):
             if pack is None:
                 continue
 
-            if pack['type'] == 'dense':
+            if pack['type'] in {'dense', 'dense_residual'}:
                 layer_delta = pack['tensor'].to(out.dtype)
                 full_layer_delta = layer_delta.reshape(pack['shape']).reshape(-1)
             else:

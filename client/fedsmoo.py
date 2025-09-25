@@ -37,8 +37,17 @@ class fedsmoo(Client):
         self.compress_every = int(args.compress_every)  # 每 K 轮压一次
         self.skip_threshold = float(args.skip_threshold)  # 跳过阈值
 
-        # 构建展平计划（严格按 named_parameters 顺序）
-        self.flatten_plan, self.total_params = build_flatten_plan(self.model)
+        # 构建/复用展平计划（严格按 named_parameters 顺序）
+        if self.use_mud and self.received_vecs.get('flatten_plan'):
+            # 复用服务器下发的展平计划，避免重复构建
+            self.flatten_plan = [dict(item) for item in self.received_vecs['flatten_plan']]
+            total = self.received_vecs.get('total_params')
+            if total is None and self.flatten_plan:
+                total = self.flatten_plan[-1]['end']
+            self.total_params = total if total is not None else sum(
+                item['end'] - item['start'] for item in self.flatten_plan)
+        else:
+            self.flatten_plan, self.total_params = build_flatten_plan(self.model)
 
     # =====================================================================
     #  ↓↓↓ 这里是修改的核心区域 ↓↓↓
@@ -127,32 +136,37 @@ class fedsmoo(Client):
             skipped, done = 0, 0
 
             for item in self.flatten_plan:
-                if not item['is_target']:
-                    continue
-
                 layer_delta = delta_w[item['start']:item['end']].reshape(item['shape'])
-                if torch.norm(layer_delta).item() < self.skip_threshold:
-                    skipped += 1
-                    continue
-
                 orig_shape = tuple(layer_delta.shape)
-                delta_2d = layer_delta.reshape(orig_shape[0], -1) if len(orig_shape) > 2 else layer_delta
 
-                if self.use_aad:
-                    layer_seed = stable_layer_seed(self.received_vecs['aad_seed'], item['name'])
-                    U, V = AAD_decomposition(delta_2d, self.mud_rank, layer_seed, lambda_reg=self.args.als_reg)
-                    kind = 'aad'
+                if item['is_target']:
+                    if torch.norm(layer_delta).item() < self.skip_threshold:
+                        skipped += 1
+                        continue
+
+                    delta_2d = layer_delta.reshape(orig_shape[0], -1) if len(orig_shape) > 2 else layer_delta
+
+                    if self.use_aad:
+                        layer_seed = stable_layer_seed(self.received_vecs['aad_seed'], item['name'])
+                        U, V = AAD_decomposition(delta_2d, self.mud_rank, layer_seed, lambda_reg=self.args.als_reg)
+                        kind = 'aad'
+                    else:
+                        U, V = post_hoc_decomposition(delta_2d, self.mud_rank)
+                        kind = 'svd'
+
+                    compressed[item['name']] = {
+                        'type': kind,
+                        'shape': orig_shape,
+                        'U': U.detach().cpu(),
+                        'V': V.detach().cpu(),
+                    }
+                    done += 1
                 else:
-                    U, V = post_hoc_decomposition(delta_2d, self.mud_rank)
-                    kind = 'svd'
-
-                compressed[item['name']] = {
-                    'type': kind,
-                    'shape': orig_shape,
-                    'U': U.detach().cpu(),
-                    'V': V.detach().cpu(),
-                }
-                done += 1
+                    compressed[item['name']] = {
+                        'type': 'dense',
+                        'shape': orig_shape,
+                        'tensor': layer_delta.detach().cpu(),
+                    }
 
             if getattr(self.args, "verbose", False):
                 print(f"[MUD] compressed={done}, skipped={skipped}")

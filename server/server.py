@@ -53,6 +53,10 @@ class Server(object):
         if self.args.use_mud:
             print("MUD/AAD Compression is Enabled.")
             self.flatten_plan, self.total_params = build_flatten_plan(self.server_model)
+        else:
+            self.flatten_plan = None
+            self.total_params = init_par_list.shape[0]
+
         if self.args.use_aad:
             self.aad_seed = self.args.aad_seed
         # =====================================================================
@@ -71,23 +75,28 @@ class Server(object):
             if pack is None:
                 continue
 
-            U = pack['U']  # on CPU
-            V = pack['V']  # on CPU
-
-            if pack['type'] == 'svd':
-                # 标准 MUD 重建
-                M = U @ V.T
-            elif pack['type'] == 'aad':
-                # AAD 重建
-                m, n = U.shape[0], V.shape[0]
-                rank = U.shape[1]
-                layer_seed = stable_layer_seed(self.aad_seed, item['name'])
-                U_tilde, V_tilde = generate_aad_basis(seed=layer_seed, m=m, n=n, rank=rank, device='cpu')
-                M = U @ V_tilde.T + U_tilde @ V.T
+            if pack['type'] == 'dense':
+                layer_delta = pack['tensor'].to(out.dtype)
+                full_layer_delta = layer_delta.reshape(pack['shape']).reshape(-1)
             else:
-                continue  # or raise error
+                U = pack['U']  # on CPU
+                V = pack['V']  # on CPU
 
-            full_layer_delta = M.reshape(pack['shape']).reshape(-1)
+                if pack['type'] == 'svd':
+                    # 标准 MUD 重建
+                    M = U @ V.T
+                elif pack['type'] == 'aad':
+                    # AAD 重建
+                    m, n = U.shape[0], V.shape[0]
+                    rank = U.shape[1]
+                    layer_seed = stable_layer_seed(self.aad_seed, item['name'])
+                    U_tilde, V_tilde = generate_aad_basis(seed=layer_seed, m=m, n=n, rank=rank, device='cpu')
+                    M = U @ V_tilde.T + U_tilde @ V.T
+                else:
+                    continue  # or raise error
+
+                full_layer_delta = M.reshape(pack['shape']).reshape(-1)
+
             out[item['start']:item['end']] = full_layer_delta
 
         return out.to(self.server_model_params_list.device, dtype=self.server_model_params_list.dtype)

@@ -12,6 +12,7 @@ from optimizer.utils_mud import (
     stable_layer_seed,
     AAD_decomposition,
     post_hoc_decomposition,
+    generate_aad_basis,
 )
 
 
@@ -48,6 +49,13 @@ class fedsmoo(Client):
                 item['end'] - item['start'] for item in self.flatten_plan)
         else:
             self.flatten_plan, self.total_params = build_flatten_plan(self.model)
+
+        self.ef_memory = {}
+        if self.use_mud:
+            param_dtype = next(self.model.parameters()).dtype
+            for item in self.flatten_plan:
+                if item.get('is_target'):
+                    self.ef_memory[item['name']] = torch.zeros(item['shape'], dtype=param_dtype)
 
     # =====================================================================
     #  ↓↓↓ 这里是修改的核心区域 ↓↓↓
@@ -140,11 +148,27 @@ class fedsmoo(Client):
                 orig_shape = tuple(layer_delta.shape)
 
                 if item['is_target']:
-                    if torch.norm(layer_delta).item() < self.skip_threshold:
+                    ef_tensor = self.ef_memory.get(item['name'])
+                    if ef_tensor is None or ef_tensor.shape != orig_shape:
+                        ef_tensor = torch.zeros_like(layer_delta)
+                    delta_with_ef = layer_delta + ef_tensor.to(layer_delta.dtype)
+
+                    current_norm = torch.norm(delta_with_ef).item()
+                    if current_norm < self.skip_threshold:
+                        compressed[item['name']] = {
+                            'type': 'dense_residual',
+                            'shape': orig_shape,
+                            'tensor': delta_with_ef.detach().cpu(),
+                        }
+                        self.ef_memory[item['name']] = torch.zeros_like(delta_with_ef).detach().cpu()
                         skipped += 1
                         continue
 
-                    delta_2d = layer_delta.reshape(orig_shape[0], -1) if len(orig_shape) > 2 else layer_delta
+                    delta_2d = (
+                        delta_with_ef.reshape(orig_shape[0], -1)
+                        if len(orig_shape) > 2
+                        else delta_with_ef
+                    )
 
                     if self.use_aad:
                         layer_seed = stable_layer_seed(self.received_vecs['aad_seed'], item['name'])
@@ -153,6 +177,28 @@ class fedsmoo(Client):
                     else:
                         U, V = post_hoc_decomposition(delta_2d, self.mud_rank)
                         kind = 'svd'
+
+                    if kind == 'aad':
+                        m, n = U.shape[0], V.shape[0]
+                        rank = U.shape[1]
+                        layer_seed = stable_layer_seed(self.received_vecs['aad_seed'], item['name'])
+                        U_tilde, V_tilde = generate_aad_basis(
+                            seed=layer_seed,
+                            m=m,
+                            n=n,
+                            rank=rank,
+                            device=U.device,
+                        )
+                        approx_2d = U @ V_tilde.T + U_tilde @ V.T
+                    else:
+                        approx_2d = U @ V.T
+
+                    approx_layer = (
+                        approx_2d.reshape(orig_shape)
+                        if len(orig_shape) > 2
+                        else approx_2d
+                    )
+                    self.ef_memory[item['name']] = (delta_with_ef - approx_layer).detach().cpu()
 
                     compressed[item['name']] = {
                         'type': kind,

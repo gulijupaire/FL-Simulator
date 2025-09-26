@@ -5,6 +5,7 @@ from utils import *
 from models import *
 from server import *
 from dataset import *
+from nn.dmu_init import GLOBAL_INIT_STATS, parse_init_spec
 
 #### ================= Open Float32 in A100 ================= ####
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -84,6 +85,12 @@ parser.add_argument('--dmu_pattern', choices=['ab', 'fab', 'fab+cfd'], default='
                     help='Pattern of deterministic matrix updates for DMU layers')
 parser.add_argument('--dmu_init_mag', type=float, default=1e-3,
                     help='Initial magnitude for DMU trainable factors')
+parser.add_argument('--dmu_init', type=str, default=None,
+                    help='Initialisation specification for DMU factors (e.g., "uni_0.3", "nor_0.1")')
+parser.add_argument('--dmu_rank_scale', type=str, default='r_quarter',
+                    help='Rank-dependent magnitude scaling mode: none / r_quarter / r_sqrt')
+parser.add_argument('--dmu_log_stats', type=str2bool, default=False,
+                    help='Log DMU initialisation/reset statistics at the end of training')
 parser.add_argument('--dmu_skip_first', type=int, default=0,
                     help='Number of leading Linear/Conv2d layers to keep dense')
 parser.add_argument('--dmu_skip_last', type=int, default=0,
@@ -125,6 +132,24 @@ args.aad_seed = int(args.aad_seed)
 args.use_dmu = bool(str2bool(args.use_dmu) if isinstance(args.use_dmu, str) else args.use_dmu)
 args.dmu_pattern = args.dmu_pattern.lower()
 args.dmu_init_mag = float(args.dmu_init_mag)
+args.dmu_log_stats = bool(str2bool(args.dmu_log_stats) if isinstance(args.dmu_log_stats, str) else args.dmu_log_stats)
+if args.dmu_init is not None:
+    dist, mag = parse_init_spec(args.dmu_init)
+else:
+    dist, mag = parse_init_spec(args.dmu_init_mag)
+args.dmu_init_dist = dist
+args.dmu_init_mag = float(mag)
+
+rank_scale_aliases = {
+    'none': 'none',
+    'r_quarter': 'r_quarter',
+    'r-0.25': 'r_quarter',
+    'quarter': 'r_quarter',
+    'r_sqrt': 'r_sqrt',
+    'r-0.5': 'r_sqrt',
+    'sqrt': 'r_sqrt',
+}
+args.dmu_rank_scale = rank_scale_aliases.get(str(args.dmu_rank_scale).lower(), 'r_quarter')
 args.dmu_skip_first = max(0, int(args.dmu_skip_first))
 args.dmu_skip_last = max(0, int(args.dmu_skip_last))
 if args.dmu_seed is None:
@@ -133,6 +158,10 @@ args.dmu_seed = int(args.dmu_seed)
 if not args.log_dir:
     args.log_dir = args.out_file
 print(args)
+
+GLOBAL_INIT_STATS.set_enabled(args.dmu_log_stats)
+if args.dmu_log_stats:
+    GLOBAL_INIT_STATS.clear()
 
 torch.manual_seed(args.seed)
 torch.cuda.manual_seed_all(args.seed)
@@ -177,6 +206,9 @@ if __name__=='__main__':
             pattern=args.dmu_pattern,
             skip_first=args.dmu_skip_first,
             skip_last=args.dmu_skip_last,
+            init_dist=args.dmu_init_dist,
+            rank_scale=args.dmu_rank_scale,
+            log_stats=args.dmu_log_stats,
         )
 
         def model_func():
@@ -221,4 +253,7 @@ if __name__=='__main__':
     _server = server_func(device=device, model_func=model_func, init_model=init_model, init_par_list=init_par_list,
                           datasets=data_obj, method=args.method, args=args)
     _server.train()
+    if args.dmu_log_stats:
+        for line in GLOBAL_INIT_STATS.summary_lines():
+            print(line)
     

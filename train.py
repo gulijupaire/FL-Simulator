@@ -48,6 +48,7 @@ parser.add_argument('--seed', default=20, type=int)                             
 parser.add_argument('--cuda', default=0, type=int)                                                         # select the cuda ID
 parser.add_argument('--data-file', default='./', type=str)                                                 # select the path of the root of Dataset
 parser.add_argument('--out-file', default='out/', type=str)                                                # select the path of the log files
+parser.add_argument('--log-dir', default=None, type=str)                                                   # directory for logs
 parser.add_argument('--save-model', action='store_true', default=False)                                    # activate if save the model
 parser.add_argument('--use-RI', action='store_true', default=False)                                        # activate if use relaxed initialization (RI)
 
@@ -101,6 +102,8 @@ parser.add_argument('--skip-threshold', type=float, default=1e-6,
                     help='Skip layer compression if ||ΔW|| < threshold')
 parser.add_argument('--als-reg', type=float, default=1e-4,
                     help='AAD ridge regularization λ')
+parser.add_argument('--comm-baseline', choices=['dense_delta', 'full_model'], default='dense_delta',
+                    help='Baseline used for communication statistics')
 
 args = parser.parse_args()
 args.use_mud = bool(str2bool(args.use_mud) if isinstance(args.use_mud, str) else args.use_mud)
@@ -127,6 +130,8 @@ args.dmu_skip_last = max(0, int(args.dmu_skip_last))
 if args.dmu_seed is None:
     args.dmu_seed = args.aad_seed
 args.dmu_seed = int(args.dmu_seed)
+if not args.log_dir:
+    args.log_dir = args.out_file
 print(args)
 
 torch.manual_seed(args.seed)

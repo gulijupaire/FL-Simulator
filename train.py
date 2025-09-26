@@ -76,6 +76,20 @@ parser.add_argument('--kron_blocks', type=int, default=1,
 parser.add_argument('--aad_seed', type=int, default=20250105,
                     help='Global shared seed for AAD basis construction')
 
+# --- Parametric DMU configuration ---
+parser.add_argument('--use_dmu', type=str2bool, default=False,
+                    help='Enable parametric DMU layers during training')
+parser.add_argument('--dmu_pattern', choices=['ab', 'fab', 'fab+cfd'], default='ab',
+                    help='Pattern of deterministic matrix updates for DMU layers')
+parser.add_argument('--dmu_init_mag', type=float, default=1e-3,
+                    help='Initial magnitude for DMU trainable factors')
+parser.add_argument('--dmu_skip_first', type=int, default=0,
+                    help='Number of leading Linear/Conv2d layers to keep dense')
+parser.add_argument('--dmu_skip_last', type=int, default=0,
+                    help='Number of trailing Linear/Conv2d layers to keep dense')
+parser.add_argument('--dmu_seed', type=int, default=None,
+                    help='Base seed for deterministic DMU layer initialisation (defaults to --aad_seed if unset)')
+
 # 别名：将 --start-compress-round 映射到 warmup_rounds
 parser.add_argument('--start-compress-round', dest='warmup_rounds', type=int, default=20,
                     help='Rounds without compression at the beginning')
@@ -105,6 +119,14 @@ args.warmup_rounds = max(0, args.warmup_rounds)
 args.target_cr = max(0.0, float(args.target_cr))
 args.kron_blocks = max(1, args.kron_blocks)
 args.aad_seed = int(args.aad_seed)
+args.use_dmu = bool(str2bool(args.use_dmu) if isinstance(args.use_dmu, str) else args.use_dmu)
+args.dmu_pattern = args.dmu_pattern.lower()
+args.dmu_init_mag = float(args.dmu_init_mag)
+args.dmu_skip_first = max(0, int(args.dmu_skip_first))
+args.dmu_skip_last = max(0, int(args.dmu_skip_last))
+if args.dmu_seed is None:
+    args.dmu_seed = args.aad_seed
+args.dmu_seed = int(args.dmu_seed)
 print(args)
 
 torch.manual_seed(args.seed)
@@ -138,8 +160,27 @@ if __name__=='__main__':
         raise NotImplementedError('not implemented dataset yet')
 
     ### Generate Model Function
-    model_func = lambda: client_model(args.model, classes)
+    base_model_func = lambda: client_model(args.model, classes)
     print("Initialize the Model Func  --->  {:s} model".format(args.model))
+
+    if args.use_dmu:
+        from nn.dmu_wrap import DMUConfig, dmu_wrap
+
+        dmu_cfg = DMUConfig(
+            rank=max(1, args.rank or 1),
+            init_mag=args.dmu_init_mag,
+            pattern=args.dmu_pattern,
+            skip_first=args.dmu_skip_first,
+            skip_last=args.dmu_skip_last,
+        )
+
+        def model_func():
+            model = base_model_func()
+            return dmu_wrap(model, dmu_cfg, seed=args.dmu_seed)
+
+    else:
+        model_func = base_model_func
+
     init_model = model_func()
     total_trainable_params = sum(p.numel() for p in init_model.parameters() if p.requires_grad)
     print("                           --->  {:d} parameters".format(total_trainable_params))

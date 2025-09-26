@@ -6,6 +6,8 @@ from typing import Dict, Optional
 import numpy as np
 import torch
 from utils import *
+from utils.comm_meter import CommMeter
+from utils.comm_size import count_tensor_bytes, dense_bytes_from_shapes
 from dataset import Dataset
 from torch.utils import data
 
@@ -21,9 +23,26 @@ from optimizer.utils_mud import (
 )
 
 
+COMM_METER = None
+
+
+def init_comm_meter(args):
+    global COMM_METER
+    baseline = getattr(args, 'comm_baseline', 'dense_delta')
+    log_dir = getattr(args, 'log_dir', getattr(args, 'out_file', './out'))
+    args.comm_baseline = baseline
+    args.log_dir = log_dir
+    COMM_METER = CommMeter(log_dir, baseline=baseline)
+
+
 class Server(object):
     def __init__(self, device, model_func, init_model, init_par_list, datasets, method, args):
         self.args = args
+        if not getattr(self.args, 'log_dir', None):
+            self.args.log_dir = getattr(self.args, 'out_file', './out')
+        if not getattr(self.args, 'comm_baseline', None):
+            self.args.comm_baseline = 'dense_delta'
+        init_comm_meter(self.args)
         self.device = device
         self.datasets = datasets
         self.model_func = model_func
@@ -64,12 +83,46 @@ class Server(object):
             self.flatten_plan = None
             self.total_params = init_par_list.shape[0]
 
+        self._target_layer_shapes = None
+        if self.flatten_plan is not None:
+            targets = [meta['shape'] for meta in self.flatten_plan if meta.get('is_target', False)]
+            if targets:
+                self._target_layer_shapes = targets
+            else:
+                self._target_layer_shapes = [meta['shape'] for meta in self.flatten_plan]
+        self._full_model_shapes = [
+            p.shape for p in self.server_model.state_dict().values()
+            if torch.is_tensor(p) and p.dtype.is_floating_point
+        ]
+
         self.latest_downlink_payload = None
         self.latest_dmu_seed_map = None
 
         if getattr(self.args, 'use_aad', False):
             self.aad_seed = self.args.aad_seed
         # =====================================================================
+
+    def _baseline_bytes(self):
+        baseline = getattr(self.args, 'comm_baseline', 'dense_delta')
+        if baseline == 'full_model':
+            shapes = self._full_model_shapes
+        else:
+            shapes = self._target_layer_shapes or self._full_model_shapes
+        return dense_bytes_from_shapes(shapes, dtype=torch.float32) if shapes else 0
+
+    @staticmethod
+    def _infer_payload_mode(payload):
+        if isinstance(payload, dict):
+            modes = {
+                entry.get('type', 'unknown')
+                for entry in payload.values()
+                if isinstance(entry, dict) and entry.get('type')
+            }
+            if len(modes) == 1:
+                return next(iter(modes))
+            if len(modes) > 1:
+                return '+'.join(sorted(modes))
+        return 'unknown'
 
     # =====================================================================
     #  ↓↓↓ 改动 2: 添加用于解压/重建的辅助函数 ↓↓↓
@@ -336,10 +389,25 @@ class Server(object):
                 if getattr(self.args, 'use_aad', False):
                     self.comm_vecs['aad_seed'] = self.aad_seed
 
+                if COMM_METER is not None:
+                    payload_for_client = self.comm_vecs.get('down_payload_t')
+                    actual = count_tensor_bytes(payload_for_client) if payload_for_client else 0
+                    baseline = self._baseline_bytes()
+                    mode = self._infer_payload_mode(payload_for_client) if payload_for_client else 'dense'
+                    COMM_METER.add('downlink', actual, baseline, mode)
+
                 _edge_device = self.Client(device=self.device, model_func=self.model_func, received_vecs=self.comm_vecs,
                                            dataset=dataset, lr=self.lr, args=self.args)
 
                 rec = _edge_device.train()
+
+                if COMM_METER is not None and isinstance(rec, dict):
+                    metrics = rec.get('metrics') or {}
+                    up_act = int(metrics.get('uplink_actual_bytes', 0))
+                    up_base = int(metrics.get('uplink_baseline_bytes', 0))
+                    up_mode = metrics.get('uplink_mode', 'unknown')
+                    if up_act or up_base:
+                        COMM_METER.add('uplink', up_act, up_base, up_mode)
 
                 # =====================================================================
                 #  ↓↓↓ 改动 3: 替换原有的接收逻辑，智能处理压缩/非压缩更新 ↓↓↓
@@ -391,6 +459,19 @@ class Server(object):
             end = time.time()
             self.time[t] = end - start
             print("            ----    Time: {:.2f}s".format(self.time[t]), flush=True)
+
+            if COMM_METER is not None:
+                COMM_METER.tick_round()
+
+        if COMM_METER is not None:
+            summary = COMM_METER.summary()
+            COMM_METER.dump(filename='comm_report.json')
+            print(
+                "[Comm] totalCR={:.2f}x, uplinkCR={:.2f}x, downlinkCR={:.2f}x, totalMB={:.2f}/{:.2f} (actual/baseline)".format(
+                    summary['total_cr'], summary['uplink_cr'], summary['downlink_cr'],
+                    summary['total_MB'], summary['total_baseline_MB']
+                )
+            )
 
         self._save_results_()
         self._summary_()

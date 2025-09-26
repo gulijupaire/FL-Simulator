@@ -6,6 +6,7 @@ from utils import *
 from optimizer import *
 # 你已有的导入……
 from utils import get_mdl_params, param_to_vector
+from utils.comm_size import count_tensor_bytes, dense_bytes_from_shapes
 # 将错误的导入语句替换为下面这句
 from optimizer.utils_mud import (
     build_flatten_plan,
@@ -151,6 +152,43 @@ class fedsmoo(Client):
                 comm_vecs['local_update_list'] = delta_w_full
         else:
             comm_vecs['local_update_list'] = delta_w_full
+
+        payload_for_uplink = None
+        if comm_vecs['compressed_update'] is not None:
+            payload_for_uplink = comm_vecs['compressed_update']
+        elif comm_vecs['local_update_list'] is not None:
+            payload_for_uplink = comm_vecs['local_update_list']
+
+        uplink_actual = count_tensor_bytes(payload_for_uplink) if payload_for_uplink is not None else 0
+
+        baseline_mode = getattr(self.args, 'comm_baseline', 'dense_delta')
+        if baseline_mode == 'full_model':
+            shapes = [
+                tensor.shape for tensor in self.model.state_dict().values()
+                if torch.is_tensor(tensor) and tensor.dtype.is_floating_point
+            ]
+        else:
+            shapes = [
+                item['shape'] for item in self.flatten_plan
+                if item.get('is_target', False)
+            ] if self.flatten_plan else []
+            if not shapes:
+                shapes = [item['shape'] for item in self.flatten_plan] if self.flatten_plan else [
+                    tensor.shape for tensor in self.model.state_dict().values()
+                    if torch.is_tensor(tensor) and tensor.dtype.is_floating_point
+                ]
+
+        uplink_baseline = dense_bytes_from_shapes(shapes, dtype=torch.float32) if shapes else 0
+
+        uplink_mode = self.aad_pattern if comm_vecs['use_compression'] else 'dense'
+        if not uplink_mode or uplink_mode == 'none':
+            uplink_mode = 'dense'
+
+        comm_vecs['metrics'] = {
+            'uplink_actual_bytes': int(uplink_actual),
+            'uplink_baseline_bytes': int(uplink_baseline),
+            'uplink_mode': uplink_mode,
+        }
 
         return comm_vecs
 

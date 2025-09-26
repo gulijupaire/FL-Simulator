@@ -1,14 +1,12 @@
 import torch
 
 
-
 def param_to_vector(model):
     # model parameters ---> vector (same storage)
     vec = []
     for param in model.parameters():
         vec.append(param.reshape(-1))
     return torch.cat(vec)
-
 
 
 def get_params_list_with_shape(model, param_list, device):
@@ -28,6 +26,7 @@ def get_mdl_params(model, device=None):
     vec = torch.nn.utils.parameters_to_vector([p.detach() for p in model.parameters()])
     return vec.to(device) if device is not None else vec
 
+
 def set_mdl_params(model, vec):
     """
     用向量形式参数覆盖到模型（in-place）
@@ -35,5 +34,3 @@ def set_mdl_params(model, vec):
     device = next(model.parameters()).device
     vec = vec.detach().to(device)
     torch.nn.utils.vector_to_parameters(vec, model.parameters())
-
-

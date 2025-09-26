@@ -130,16 +130,23 @@ class fedsmoo(Client):
             'use_compression': False,
             'compressed_update': None,
             'local_update_list': None,
+            'local_model_param_list': None,
             'local_dynamic_dual': self.received_vecs['Dynamic_dual'],
             'aad_seed': self.received_vecs.get('aad_seed', self.aad_seed) if self.use_aad else None,
             'round': current_round,
         }
 
-        if should_compress:
-            compressed = self.compress_update_post_hoc(delta_w_full)
-            if compressed:
+        if self.use_mud:
+            payload = None
+            if should_compress:
+                payload = self.compress_update_post_hoc(delta_w_full)
+
+            if not payload:
+                payload = self.pack_dense_update(delta_w_full, reset_error=True)
+
+            if payload:
                 comm_vecs['use_compression'] = True
-                comm_vecs['compressed_update'] = compressed
+                comm_vecs['compressed_update'] = payload
             else:
                 comm_vecs['local_update_list'] = delta_w_full
         else:
@@ -314,3 +321,23 @@ class fedsmoo(Client):
         except Exception as e:
             print(f"[MUD] Compression failed: {e}")
             return None
+
+    def pack_dense_update(self, delta_w, *, reset_error: bool = True):
+        """Pack a dense update into per-layer tensors for server reconstruction."""
+
+        if not self.flatten_plan:
+            return None
+
+        packed = {}
+        for item in self.flatten_plan:
+            layer_delta = delta_w[item['start']:item['end']].reshape(item['shape'])
+            packed[item['name']] = {
+                'type': 'dense',
+                'shape': item['shape'],
+                'tensor': layer_delta.detach().cpu(),
+            }
+
+            if reset_error and item.get('is_target') and item['name'] in self.ef_memory:
+                self.ef_memory[item['name']] = torch.zeros_like(layer_delta).detach().cpu()
+
+        return packed if packed else None

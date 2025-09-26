@@ -1,6 +1,8 @@
 import os
 import time
 import datetime
+from typing import Dict, Optional
+
 import numpy as np
 import torch
 from utils import *
@@ -13,6 +15,9 @@ from optimizer.utils_mud import (
     generate_aad_basis,
     bkd_recover,
     bkd_aad_recover,
+    AAD_decomposition,
+    post_hoc_decomposition,
+    bkd_decomposition,
 )
 
 
@@ -58,6 +63,9 @@ class Server(object):
         else:
             self.flatten_plan = None
             self.total_params = init_par_list.shape[0]
+
+        self.latest_global_update_pack = None
+        self.latest_dmu_seed_map = None
 
         if self.args.use_aad:
             self.aad_seed = self.args.aad_seed
@@ -117,6 +125,64 @@ class Server(object):
             out[item['start']:item['end']] = full_layer_delta
 
         return out.to(self.server_model_params_list.device, dtype=self.server_model_params_list.dtype)
+
+    def pack_global_update(self, delta_vec: torch.Tensor) -> Optional[Dict[str, Dict[str, object]]]:
+        """Pack a dense global update vector for downlink broadcasting."""
+
+        if not self.args.use_mud or self.flatten_plan is None:
+            return None
+
+        packed: Dict[str, Dict[str, object]] = {}
+        rank = max(1, int(getattr(self.args, 'rank', 1)))
+        lambda_reg = float(getattr(self.args, 'als_reg', 1e-4))
+        use_aad = bool(getattr(self.args, 'use_aad', False))
+
+        for item in self.flatten_plan:
+            start, end = item['start'], item['end']
+            if start >= end:
+                continue
+
+            layer_delta = delta_vec[start:end].reshape(item['shape'])
+            entry: Dict[str, object] = {'shape': item['shape']}
+
+            if not item.get('is_target', False):
+                entry.update({'type': 'dense', 'tensor': layer_delta.detach().cpu()})
+                packed[item['name']] = entry
+                continue
+
+            matrix = layer_delta.reshape(layer_delta.shape[0], -1) if layer_delta.ndim > 2 else layer_delta
+            matrix = matrix.to(dtype=torch.float32)
+
+            if use_aad:
+                layer_seed = stable_layer_seed(self.aad_seed, item['name'])
+                U, V = AAD_decomposition(matrix, rank, layer_seed, lambda_reg=lambda_reg)
+                entry.update({
+                    'type': 'aad',
+                    'U': U.detach().cpu(),
+                    'V': V.detach().cpu(),
+                })
+            else:
+                U, V = post_hoc_decomposition(matrix, rank)
+                entry.update({
+                    'type': 'svd',
+                    'U': U.detach().cpu(),
+                    'V': V.detach().cpu(),
+                })
+
+            packed[item['name']] = entry
+
+        return packed if packed else None
+
+    def _build_dmu_seed_map(self, round_idx: int) -> Optional[Dict[str, int]]:
+        if not getattr(self.args, 'use_dmu', False) or self.flatten_plan is None:
+            return None
+
+        base_seed = int(getattr(self.args, 'dmu_seed', getattr(self.args, 'aad_seed', 0)))
+        seeds: Dict[str, int] = {}
+        for item in self.flatten_plan:
+            seeds[item['name']] = int(stable_layer_seed(base_seed + round_idx, item['name']))
+
+        return seeds if seeds else None
 
     # =====================================================================
 
@@ -257,6 +323,15 @@ class Server(object):
                 dataset = (self.datasets.client_x[client], self.datasets.client_y[client])
                 self.process_for_communication(client, Averaged_update)
 
+                if self.args.use_mud:
+                    self.comm_vecs['global_update_pack'] = self.latest_global_update_pack
+                    self.comm_vecs['dmu_seed_map'] = self.latest_dmu_seed_map
+                    self.comm_vecs['apply_global_update'] = bool(self.latest_global_update_pack)
+                else:
+                    self.comm_vecs.pop('global_update_pack', None)
+                    self.comm_vecs.pop('dmu_seed_map', None)
+                    self.comm_vecs.pop('apply_global_update', None)
+
                 _edge_device = self.Client(device=self.device, model_func=self.model_func, received_vecs=self.comm_vecs,
                                            dataset=dataset, lr=self.lr, args=self.args)
 
@@ -293,8 +368,18 @@ class Server(object):
             Averaged_update = torch.mean(self.clients_updated_params_list[selected_clients], dim=0)
             Averaged_model = torch.mean(self.clients_params_list[selected_clients], dim=0)
 
+            prev_global_params = self.server_model_params_list.clone()
             self.server_model_params_list = self.global_update(selected_clients, Averaged_update, Averaged_model)
             set_mdl_params(self.server_model, self.server_model_params_list)
+
+            if self.args.use_mud:
+                delta_global = (self.server_model_params_list - prev_global_params).detach().cpu()
+                self.latest_global_update_pack = self.pack_global_update(delta_global)
+                round_idx = int(getattr(self, 'current_round', 0)) + 1
+                self.latest_dmu_seed_map = self._build_dmu_seed_map(round_idx)
+            else:
+                self.latest_global_update_pack = None
+                self.latest_dmu_seed_map = None
 
             self._test_(t, selected_clients)
             self._lr_scheduler_()

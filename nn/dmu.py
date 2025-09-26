@@ -21,7 +21,8 @@ class MatUpdate(nn.Module):
         if pattern not in self._ALLOWED_PATTERNS:
             raise ValueError(f"Unsupported pattern: {pattern}")
 
-        self.in_f, self.out_f, self.r = int(in_f), int(out_f), int(rank)
+        self.in_f, self.out_f = int(in_f), int(out_f)
+        self.r = min(int(rank), self.in_f, self.out_f)
         self.pattern = pattern
 
         # Trainable factors
@@ -40,6 +41,24 @@ class MatUpdate(nn.Module):
 
         nn.init.uniform_(self.U, -float(init_mag), float(init_mag))
         nn.init.zeros_(self.V)
+
+
+@torch.no_grad()
+def _reset_update_inplace(update: "MatUpdate", seed: int, init_mag: float) -> None:
+    """Reset a MatUpdate instance in-place without replacing Parameter objects."""
+
+    device = update.Ut.device
+    if device.type == "cuda":
+        generator = torch.Generator(device=device)
+    else:
+        generator = torch.Generator()
+    generator.manual_seed(int(seed))
+
+    update.Ut.copy_(torch.randn_like(update.Ut, generator=generator))
+    update.Vt.copy_(torch.randn_like(update.Vt, generator=generator))
+
+    nn.init.uniform_(update.U, -float(init_mag), float(init_mag))
+    update.V.zero_()
 
     def forward_update(self) -> torch.Tensor:
         """Return the current low-rank update matrix."""
@@ -78,11 +97,7 @@ class DMU_Linear(nn.Module):
         """Accumulate the current update into the base weight and reset factors."""
 
         self.weight.add_(self.update.forward_update())
-        rank, pattern = self.update.r, self.update.pattern
-        device, dtype = self.weight.device, self.weight.dtype
-        self.update = MatUpdate(self.weight.shape[1], self.weight.shape[0],
-                                rank=rank, init_mag=init_mag, pattern=pattern, seed=seed)
-        self.update.to(device=device, dtype=dtype)
+        _reset_update_inplace(self.update, seed, init_mag)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight + self.update.forward_update(), self.bias)
@@ -123,13 +138,7 @@ class DMU_Conv2d(nn.Module):
     def push_reset_update(self, seed: int, init_mag: float) -> None:
         update = self.update.forward_update().view_as(self.weight)
         self.weight.add_(update)
-
-        rank, pattern = self.update.r, self.update.pattern
-        device, dtype = self.weight.device, self.weight.dtype
-        in_features = self.weight.shape[1] * self.weight.shape[2] * self.weight.shape[3]
-        self.update = MatUpdate(in_features, self.out_channels, rank=rank,
-                                init_mag=init_mag, pattern=pattern, seed=seed)
-        self.update.to(device=device, dtype=dtype)
+        _reset_update_inplace(self.update, seed, init_mag)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         update = self.update.forward_update().view_as(self.weight)

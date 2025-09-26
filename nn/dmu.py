@@ -7,14 +7,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.modules.utils import _pair
 
+from .dmu_init import GLOBAL_INIT_STATS, init_pair_, make_generator_from_seed
+
 
 class MatUpdate(nn.Module):
     """Low-rank matrix update with optional anchored components."""
 
     _ALLOWED_PATTERNS = {"ab", "fab", "fab+cfd"}
 
-    def __init__(self, in_f: int, out_f: int, rank: int, init_mag: float,
-                 pattern: str = "ab", seed: int = 0):
+    def __init__(
+        self,
+        in_f: int,
+        out_f: int,
+        rank: int,
+        init_mag: float,
+        pattern: str = "ab",
+        seed: int = 0,
+        *,
+        init_dist: str = "uniform",
+        rank_scale: str = "r_quarter",
+        stats=GLOBAL_INIT_STATS,
+        layer_name: Optional[str] = None,
+    ):
         super().__init__()
         if rank <= 0:
             raise ValueError("rank must be positive for MatUpdate")
@@ -25,22 +39,50 @@ class MatUpdate(nn.Module):
         self.r = min(int(rank), self.in_f, self.out_f)
         self.pattern = pattern
 
+        self.init_dist = init_dist
+        self.rank_scale_mode = rank_scale
+        self.init_mag = float(init_mag)
+        self._stats = stats
+        self._layer_name = layer_name
+
         # Trainable factors
         self.U = nn.Parameter(torch.zeros(self.out_f, self.r))
         self.V = nn.Parameter(torch.zeros(self.in_f, self.r))
 
         # Fixed anchors (for AAD / BKD variants)
-        g = torch.Generator().manual_seed(int(seed))
-        self.Ut = nn.Parameter(torch.randn(self.out_f, self.r, generator=g), requires_grad=False)
-        self.Vt = nn.Parameter(torch.randn(self.in_f, self.r, generator=g), requires_grad=False)
+        anchor_gen = make_generator_from_seed(seed)
+        self.Ut = nn.Parameter(
+            torch.randn(self.out_f, self.r, generator=anchor_gen), requires_grad=False
+        )
+        self.Vt = nn.Parameter(
+            torch.randn(self.in_f, self.r, generator=anchor_gen), requires_grad=False
+        )
 
-        self.reset(init_mag)
+        self.reset(init_mag=init_mag, generator=make_generator_from_seed(seed), event="init")
 
-    def reset(self, init_mag: float) -> None:
+    def reset(
+        self,
+        init_mag: Optional[float] = None,
+        *,
+        generator: Optional[torch.Generator] = None,
+        event: str = "init",
+    ) -> None:
         """Re-initialise the trainable factors."""
 
-        nn.init.uniform_(self.U, -float(init_mag), float(init_mag))
-        nn.init.zeros_(self.V)
+        if init_mag is not None:
+            self.init_mag = float(init_mag)
+        init_pair_(
+            self.U,
+            self.V,
+            self.init_dist,
+            self.init_mag,
+            self.r,
+            self.rank_scale_mode,
+            generator=generator,
+            stats=self._stats,
+            layer=self._layer_name,
+            event=event,
+        )
 
     def forward_update(self) -> torch.Tensor:
         """Return the current low-rank update matrix respecting the chosen pattern."""
@@ -63,21 +105,41 @@ def _reset_update_inplace(update: "MatUpdate", seed: int, init_mag: float) -> No
         generator = torch.Generator(device=device)
     else:
         generator = torch.Generator()
-    generator.manual_seed(int(seed))
+    trainable_gen = make_generator_from_seed(seed, device=update.U.device)
+    if init_mag is not None:
+        update.init_mag = float(init_mag)
 
-    update.Ut.copy_(torch.randn_like(update.Ut, generator=generator))
-    update.Vt.copy_(torch.randn_like(update.Vt, generator=generator))
+    if update.Ut.device == update.U.device:
+        anchor_gen = trainable_gen
+    else:
+        anchor_gen = make_generator_from_seed(seed, device=update.Ut.device)
 
-    nn.init.uniform_(update.U, -float(init_mag), float(init_mag))
-    update.V.zero_()
+    update.Ut.copy_(torch.randn_like(update.Ut, generator=anchor_gen))
+    update.Vt.copy_(torch.randn_like(update.Vt, generator=anchor_gen))
+
+    update.reset(generator=trainable_gen, event="reset")
 
 
 class DMU_Linear(nn.Module):
     """Linear layer augmented with a deterministic matrix update."""
 
-    def __init__(self, in_f: int, out_f: int, *, base: Optional[torch.Tensor] = None,
-                 bias: Optional[torch.Tensor] = None, bias_requires_grad: bool = True,
-                 rank: int, init_mag: float, pattern: str = "ab", seed: int = 0):
+    def __init__(
+        self,
+        in_f: int,
+        out_f: int,
+        *,
+        base: Optional[torch.Tensor] = None,
+        bias: Optional[torch.Tensor] = None,
+        bias_requires_grad: bool = True,
+        rank: int,
+        init_mag: float,
+        pattern: str = "ab",
+        seed: int = 0,
+        init_dist: str = "uniform",
+        rank_scale: str = "r_quarter",
+        stats=GLOBAL_INIT_STATS,
+        layer_name: Optional[str] = None,
+    ):
         super().__init__()
 
         self.in_features = in_f
@@ -90,10 +152,21 @@ class DMU_Linear(nn.Module):
         else:
             self.bias = nn.Parameter(bias.detach().clone(), requires_grad=bias_requires_grad)
 
-        self.update = MatUpdate(in_f, out_f, rank=rank, init_mag=init_mag, pattern=pattern, seed=seed)
+        self.update = MatUpdate(
+            in_f,
+            out_f,
+            rank=rank,
+            init_mag=init_mag,
+            pattern=pattern,
+            seed=seed,
+            init_dist=init_dist,
+            rank_scale=rank_scale,
+            stats=stats,
+            layer_name=layer_name,
+        )
 
     @torch.no_grad()
-    def push_reset_update(self, seed: int, init_mag: float) -> None:
+    def push_reset_update(self, seed: int, init_mag: Optional[float] = None) -> None:
         """Accumulate the current update into the base weight and reset factors."""
 
         self.weight.add_(self.update.forward_update())
@@ -106,8 +179,19 @@ class DMU_Linear(nn.Module):
 class DMU_Conv2d(nn.Module):
     """Conv2d layer augmented with a deterministic matrix update."""
 
-    def __init__(self, conv: nn.Conv2d, *, rank: int, init_mag: float,
-                 pattern: str = "ab", seed: int = 0):
+    def __init__(
+        self,
+        conv: nn.Conv2d,
+        *,
+        rank: int,
+        init_mag: float,
+        pattern: str = "ab",
+        seed: int = 0,
+        init_dist: str = "uniform",
+        rank_scale: str = "r_quarter",
+        stats=GLOBAL_INIT_STATS,
+        layer_name: Optional[str] = None,
+    ):
         super().__init__()
 
         self.in_channels = conv.in_channels
@@ -131,11 +215,21 @@ class DMU_Conv2d(nn.Module):
             self.bias = nn.Parameter(conv.bias.detach().clone(), requires_grad=conv.bias.requires_grad)
 
         in_features = self.weight.shape[1] * self.weight.shape[2] * self.weight.shape[3]
-        self.update = MatUpdate(in_features, self.out_channels, rank=rank,
-                                init_mag=init_mag, pattern=pattern, seed=seed)
+        self.update = MatUpdate(
+            in_features,
+            self.out_channels,
+            rank=rank,
+            init_mag=init_mag,
+            pattern=pattern,
+            seed=seed,
+            init_dist=init_dist,
+            rank_scale=rank_scale,
+            stats=stats,
+            layer_name=layer_name,
+        )
 
     @torch.no_grad()
-    def push_reset_update(self, seed: int, init_mag: float) -> None:
+    def push_reset_update(self, seed: int, init_mag: Optional[float] = None) -> None:
         update = self.update.forward_update().view_as(self.weight)
         self.weight.add_(update)
         _reset_update_inplace(self.update, seed, init_mag)

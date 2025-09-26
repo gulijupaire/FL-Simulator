@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from optimizer.utils_mud import stable_layer_seed
 from .dmu import DMU_Conv2d, DMU_Linear
+from .dmu_init import GLOBAL_INIT_STATS
 
 
 @dataclass
@@ -18,6 +19,9 @@ class DMUConfig:
     pattern: str = "ab"
     skip_first: int = 0
     skip_last: int = 0
+    init_dist: str = "uniform"
+    rank_scale: str = "r_quarter"
+    log_stats: bool = False
 
     def validate(self) -> None:
         if self.rank <= 0:
@@ -26,6 +30,10 @@ class DMUConfig:
             raise ValueError("DMU init_mag must be non-negative")
         if self.skip_first < 0 or self.skip_last < 0:
             raise ValueError("skip counts must be non-negative")
+        if self.init_dist not in {"uniform", "normal"}:
+            raise ValueError("init_dist must be 'uniform' or 'normal'")
+        if self.rank_scale not in {"none", "r_quarter", "r_sqrt"}:
+            raise ValueError("rank_scale must be one of {'none', 'r_quarter', 'r_sqrt'}")
 
 
 def _collect_target_layers(model: nn.Module) -> List[Tuple[nn.Module, str, nn.Module, str]]:
@@ -58,6 +66,8 @@ def dmu_wrap(model: nn.Module, cfg: DMUConfig, seed: int) -> nn.Module:
     start = min(cfg.skip_first, total)
     end = total - min(cfg.skip_last, total - start)
 
+    stats = GLOBAL_INIT_STATS if cfg.log_stats else None
+
     for index, (parent, name, layer, qualified_name) in enumerate(targets):
         if index < start or index >= end:
             continue
@@ -77,6 +87,10 @@ def dmu_wrap(model: nn.Module, cfg: DMUConfig, seed: int) -> nn.Module:
                 init_mag=cfg.init_mag,
                 pattern=cfg.pattern,
                 seed=layer_seed,
+                init_dist=cfg.init_dist,
+                rank_scale=cfg.rank_scale,
+                stats=stats,
+                layer_name=qualified_name,
             )
         else:  # nn.Conv2d
             wrapped = DMU_Conv2d(
@@ -85,6 +99,10 @@ def dmu_wrap(model: nn.Module, cfg: DMUConfig, seed: int) -> nn.Module:
                 init_mag=cfg.init_mag,
                 pattern=cfg.pattern,
                 seed=layer_seed,
+                init_dist=cfg.init_dist,
+                rank_scale=cfg.rank_scale,
+                stats=stats,
+                layer_name=qualified_name,
             )
         setattr(parent, name, wrapped)
 

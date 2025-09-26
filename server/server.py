@@ -11,6 +11,8 @@ from optimizer.utils_mud import (
     build_flatten_plan,
     stable_layer_seed,
     generate_aad_basis,
+    bkd_recover,
+    bkd_aad_recover,
 )
 
 
@@ -79,23 +81,38 @@ class Server(object):
                 layer_delta = pack['tensor'].to(out.dtype)
                 full_layer_delta = layer_delta.reshape(pack['shape']).reshape(-1)
             else:
-                U = pack['U']  # on CPU
-                V = pack['V']  # on CPU
+                pack_type = pack['type']
+                if pack_type in {'svd', 'aad'}:
+                    U = pack['U']
+                    V = pack['V']
 
-                if pack['type'] == 'svd':
-                    # 标准 MUD 重建
-                    M = U @ V.T
-                elif pack['type'] == 'aad':
-                    # AAD 重建
-                    m, n = U.shape[0], V.shape[0]
-                    rank = U.shape[1]
-                    layer_seed = stable_layer_seed(self.aad_seed, item['name'])
-                    U_tilde, V_tilde = generate_aad_basis(seed=layer_seed, m=m, n=n, rank=rank, device='cpu')
-                    M = U @ V_tilde.T + U_tilde @ V.T
+                    if pack_type == 'svd':
+                        M = U @ V.T
+                    else:
+                        m, n = U.shape[0], V.shape[0]
+                        rank = U.shape[1]
+                        layer_seed = stable_layer_seed(self.aad_seed, item['name'])
+                        U_tilde, V_tilde = generate_aad_basis(seed=layer_seed, m=m, n=n, rank=rank, device='cpu')
+                        M = U @ V_tilde.T + U_tilde @ V.T
+                elif pack_type == 'bkd':
+                    M = bkd_recover(pack['U_list'], pack['V_list'], pack['meta'])
+                elif pack_type == 'bkd_aad':
+                    M = bkd_aad_recover(
+                        pack['U_list'],
+                        pack['V_list'],
+                        pack['meta'],
+                        aad_seed=self.aad_seed,
+                        layer_name=item['name'],
+                    )
                 else:
-                    continue  # or raise error
+                    continue
 
-                full_layer_delta = M.reshape(pack['shape']).reshape(-1)
+                target_shape = pack.get('shape')
+                if target_shape is None and 'meta' in pack:
+                    target_shape = pack['meta']['shape']
+                if target_shape is None:
+                    target_shape = M.shape
+                full_layer_delta = M.reshape(target_shape).reshape(-1)
 
             out[item['start']:item['end']] = full_layer_delta
 

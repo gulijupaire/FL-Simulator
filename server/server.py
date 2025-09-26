@@ -64,10 +64,10 @@ class Server(object):
             self.flatten_plan = None
             self.total_params = init_par_list.shape[0]
 
-        self.latest_global_update_pack = None
+        self.latest_downlink_payload = None
         self.latest_dmu_seed_map = None
 
-        if self.args.use_aad:
+        if getattr(self.args, 'use_aad', False):
             self.aad_seed = self.args.aad_seed
         # =====================================================================
 
@@ -324,13 +324,17 @@ class Server(object):
                 self.process_for_communication(client, Averaged_update)
 
                 if self.args.use_mud:
-                    self.comm_vecs['global_update_pack'] = self.latest_global_update_pack
+                    self.comm_vecs['down_payload_t'] = self.latest_downlink_payload
                     self.comm_vecs['dmu_seed_map'] = self.latest_dmu_seed_map
-                    self.comm_vecs['apply_global_update'] = bool(self.latest_global_update_pack)
+                    self.comm_vecs['apply_global_update'] = bool(self.latest_downlink_payload)
                 else:
-                    self.comm_vecs.pop('global_update_pack', None)
+                    self.comm_vecs.pop('down_payload_t', None)
                     self.comm_vecs.pop('dmu_seed_map', None)
                     self.comm_vecs.pop('apply_global_update', None)
+
+                self.comm_vecs['round'] = int(getattr(self, 'current_round', 0))
+                if getattr(self.args, 'use_aad', False):
+                    self.comm_vecs['aad_seed'] = self.aad_seed
 
                 _edge_device = self.Client(device=self.device, model_func=self.model_func, received_vecs=self.comm_vecs,
                                            dataset=dataset, lr=self.lr, args=self.args)
@@ -374,11 +378,11 @@ class Server(object):
 
             if self.args.use_mud:
                 delta_global = (self.server_model_params_list - prev_global_params).detach().cpu()
-                self.latest_global_update_pack = self.pack_global_update(delta_global)
+                self.latest_downlink_payload = self.pack_global_update(delta_global)
                 round_idx = int(getattr(self, 'current_round', 0)) + 1
                 self.latest_dmu_seed_map = self._build_dmu_seed_map(round_idx)
             else:
-                self.latest_global_update_pack = None
+                self.latest_downlink_payload = None
                 self.latest_dmu_seed_map = None
 
             self._test_(t, selected_clients)

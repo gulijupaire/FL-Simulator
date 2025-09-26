@@ -29,9 +29,13 @@ class fedsmoo(Client):
         self.optimizer = DRegSAM(self.model.parameters(), self.base_optimizer, rho=self.args.rho)
 
         # MUD 压缩配置
-        self.use_mud = bool(args.use_mud)
-        self.mud_rank = int(args.mud_rank)
-        self.use_aad = bool(args.use_aad)
+        self.use_mud = bool(getattr(args, 'use_mud', False))
+        self.rank = int(getattr(args, 'rank', getattr(args, 'mud_rank', 0)))
+        self.use_aad = bool(getattr(args, 'use_aad', False))
+        self.enable_bkd = bool(getattr(args, 'enable_bkd', False))
+        self.target_cr = float(getattr(args, 'target_cr', 0.0))
+        self.kron_blocks = int(getattr(args, 'kron_blocks', 1))
+        self.aad_seed = int(getattr(args, 'aad_seed', 0))
 
         # 冷启动与频率控制
         self.warmup_rounds = int(args.warmup_rounds)  # 前 N 轮不压缩
@@ -116,7 +120,7 @@ class fedsmoo(Client):
             'compressed_update': None,
             'local_update_list': None,
             'local_dynamic_dual': self.received_vecs['Dynamic_dual'],
-            'aad_seed': self.received_vecs.get('aad_seed', None),
+            'aad_seed': self.received_vecs.get('aad_seed', self.aad_seed) if self.use_aad else None,
             'round': current_round,
         }
 
@@ -171,17 +175,19 @@ class fedsmoo(Client):
                     )
 
                     if self.use_aad:
-                        layer_seed = stable_layer_seed(self.received_vecs['aad_seed'], item['name'])
-                        U, V = AAD_decomposition(delta_2d, self.mud_rank, layer_seed, lambda_reg=self.args.als_reg)
+                        aad_seed = self.received_vecs.get('aad_seed', self.aad_seed)
+                        layer_seed = stable_layer_seed(aad_seed, item['name'])
+                        U, V = AAD_decomposition(delta_2d, self.rank, layer_seed, lambda_reg=self.args.als_reg)
                         kind = 'aad'
                     else:
-                        U, V = post_hoc_decomposition(delta_2d, self.mud_rank)
+                        U, V = post_hoc_decomposition(delta_2d, self.rank)
                         kind = 'svd'
 
                     if kind == 'aad':
                         m, n = U.shape[0], V.shape[0]
                         rank = U.shape[1]
-                        layer_seed = stable_layer_seed(self.received_vecs['aad_seed'], item['name'])
+                        aad_seed = self.received_vecs.get('aad_seed', self.aad_seed)
+                        layer_seed = stable_layer_seed(aad_seed, item['name'])
                         U_tilde, V_tilde = generate_aad_basis(
                             seed=layer_seed,
                             m=m,

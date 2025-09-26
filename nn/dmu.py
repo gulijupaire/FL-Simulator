@@ -42,6 +42,17 @@ class MatUpdate(nn.Module):
         nn.init.uniform_(self.U, -float(init_mag), float(init_mag))
         nn.init.zeros_(self.V)
 
+    def forward_update(self) -> torch.Tensor:
+        """Return the current low-rank update matrix respecting the chosen pattern."""
+
+        if self.pattern == "ab":  # standard low-rank U V^T
+            return self.U @ self.V.T
+        if self.pattern == "fab":  # train right, fixed left => Ut V^T
+            return self.Ut @ self.V.T
+        if self.pattern == "fab+cfd":  # Ut V^T + U Vt^T
+            return self.Ut @ self.V.T + self.U @ self.Vt.T
+        raise ValueError(f"Unsupported pattern: {self.pattern}")
+
 
 @torch.no_grad()
 def _reset_update_inplace(update: "MatUpdate", seed: int, init_mag: float) -> None:
@@ -59,17 +70,6 @@ def _reset_update_inplace(update: "MatUpdate", seed: int, init_mag: float) -> No
 
     nn.init.uniform_(update.U, -float(init_mag), float(init_mag))
     update.V.zero_()
-
-    def forward_update(self) -> torch.Tensor:
-        """Return the current low-rank update matrix."""
-
-        if self.pattern == "ab":  # standard low-rank U V^T
-            return self.U @ self.V.T
-        if self.pattern == "fab":  # train right, fixed left => Ut V^T
-            return self.Ut @ self.V.T
-        if self.pattern == "fab+cfd":  # Ut V^T + U Vt^T
-            return self.Ut @ self.V.T + self.U @ self.Vt.T
-        raise ValueError(f"Unsupported pattern: {self.pattern}")
 
 
 class DMU_Linear(nn.Module):

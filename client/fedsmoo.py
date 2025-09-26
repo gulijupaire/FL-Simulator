@@ -13,6 +13,10 @@ from optimizer.utils_mud import (
     AAD_decomposition,
     post_hoc_decomposition,
     generate_aad_basis,
+    bkd_decomposition,
+    bkd_recover,
+    bkd_aad_recover,
+    allocate_budget,
 )
 
 
@@ -36,6 +40,7 @@ class fedsmoo(Client):
         self.target_cr = float(getattr(args, 'target_cr', 0.0))
         self.kron_blocks = int(getattr(args, 'kron_blocks', 1))
         self.aad_seed = int(getattr(args, 'aad_seed', 0))
+        self.aad_pattern = getattr(args, 'aad_pattern', 'none').lower()
 
         # 冷启动与频率控制
         self.warmup_rounds = int(args.warmup_rounds)  # 前 N 轮不压缩
@@ -60,6 +65,12 @@ class fedsmoo(Client):
             for item in self.flatten_plan:
                 if item.get('is_target'):
                     self.ef_memory[item['name']] = torch.zeros(item['shape'], dtype=param_dtype)
+
+        self.layer_budget = {}
+        if self.use_mud and self.target_cr > 0:
+            mode = self.aad_pattern if self.enable_bkd else ('aad' if self.use_aad else 'svd')
+            self.layer_budget = allocate_budget(self.flatten_plan, self.target_cr, mode=mode,
+                                                base_floor=max(1, self.rank))
 
     # =====================================================================
     #  ↓↓↓ 这里是修改的核心区域 ↓↓↓
@@ -146,7 +157,10 @@ class fedsmoo(Client):
         try:
             compressed = {}
             skipped, done = 0, 0
+            layer_cache = {}
+            importance = {}
 
+            # 第一遍：缓存张量和重要性度量
             for item in self.flatten_plan:
                 layer_delta = delta_w[item['start']:item['end']].reshape(item['shape'])
                 orig_shape = tuple(layer_delta.shape)
@@ -156,11 +170,47 @@ class fedsmoo(Client):
                     if ef_tensor is None or ef_tensor.shape != orig_shape:
                         ef_tensor = torch.zeros_like(layer_delta)
                     delta_with_ef = layer_delta + ef_tensor.to(layer_delta.dtype)
+                    layer_cache[item['name']] = {
+                        'delta': layer_delta,
+                        'delta_with_ef': delta_with_ef,
+                        'orig_shape': orig_shape,
+                    }
+                    if self.target_cr > 0:
+                        importance[item['name']] = torch.norm(delta_with_ef).item()
+                else:
+                    layer_cache[item['name']] = {
+                        'delta': layer_delta,
+                        'orig_shape': orig_shape,
+                    }
 
+            # 自适应预算：叠加最新 ΔW 的范数
+            if self.use_mud and self.target_cr > 0:
+                mode = self.aad_pattern if self.enable_bkd else ('aad' if self.use_aad else 'svd')
+                dynamic_budget = allocate_budget(
+                    self.flatten_plan,
+                    self.target_cr,
+                    mode=mode,
+                    base_floor=max(1, self.rank),
+                    importance=importance,
+                )
+            else:
+                dynamic_budget = self.layer_budget
+
+            if dynamic_budget:
+                self.layer_budget = dynamic_budget
+
+            # 第二遍：执行实际压缩
+            for item in self.flatten_plan:
+                info = layer_cache[item['name']]
+                orig_shape = info['orig_shape']
+
+                if item['is_target']:
+                    delta_with_ef = info['delta_with_ef']
                     current_norm = torch.norm(delta_with_ef).item()
+
                     if current_norm < self.skip_threshold:
                         compressed[item['name']] = {
-                            'type': 'dense_residual',
+                            'type': 'dense',
                             'shape': orig_shape,
                             'tensor': delta_with_ef.detach().cpu(),
                         }
@@ -168,56 +218,92 @@ class fedsmoo(Client):
                         skipped += 1
                         continue
 
-                    delta_2d = (
-                        delta_with_ef.reshape(orig_shape[0], -1)
-                        if len(orig_shape) > 2
-                        else delta_with_ef
-                    )
+                    cfg = dynamic_budget.get(item['name'], {}) if dynamic_budget else {}
+                    rank = int(cfg.get('rank', self.rank if self.rank > 0 else 1))
+                    blocks = int(cfg.get('blocks', self.kron_blocks if self.kron_blocks > 0 else 1))
+                    rank = max(rank, 1)
+                    blocks = max(blocks, 1)
 
-                    if self.use_aad:
-                        aad_seed = self.received_vecs.get('aad_seed', self.aad_seed)
-                        layer_seed = stable_layer_seed(aad_seed, item['name'])
-                        U, V = AAD_decomposition(delta_2d, self.rank, layer_seed, lambda_reg=self.args.als_reg)
-                        kind = 'aad'
+                    if len(orig_shape) > 2:
+                        delta_2d = delta_with_ef.reshape(orig_shape[0], -1)
                     else:
-                        U, V = post_hoc_decomposition(delta_2d, self.rank)
-                        kind = 'svd'
+                        delta_2d = delta_with_ef
 
-                    if kind == 'aad':
-                        m, n = U.shape[0], V.shape[0]
-                        rank = U.shape[1]
+                    if self.enable_bkd:
+                        U_list, V_list, meta = bkd_decomposition(delta_2d, rank=rank, blocks=blocks)
                         aad_seed = self.received_vecs.get('aad_seed', self.aad_seed)
-                        layer_seed = stable_layer_seed(aad_seed, item['name'])
-                        U_tilde, V_tilde = generate_aad_basis(
-                            seed=layer_seed,
-                            m=m,
-                            n=n,
-                            rank=rank,
-                            device=U.device,
+                        if self.use_aad:
+                            approx_2d = bkd_aad_recover(
+                                U_list,
+                                V_list,
+                                meta,
+                                aad_seed=aad_seed,
+                                layer_name=item['name'],
+                                device=delta_2d.device,
+                                dtype=delta_2d.dtype,
+                            )
+                            pack_type = 'bkd_aad'
+                        else:
+                            approx_2d = bkd_recover(
+                                U_list,
+                                V_list,
+                                meta,
+                                device=delta_2d.device,
+                                dtype=delta_2d.dtype,
+                            )
+                            pack_type = 'bkd'
+
+                        approx_layer = (
+                            approx_2d.reshape(orig_shape)
+                            if len(orig_shape) > 2
+                            else approx_2d
                         )
-                        approx_2d = U @ V_tilde.T + U_tilde @ V.T
+                        self.ef_memory[item['name']] = (delta_with_ef - approx_layer).detach().cpu()
+                        compressed[item['name']] = {
+                            'type': pack_type,
+                            'shape': orig_shape,
+                            'U_list': [U.cpu() for U in U_list],
+                            'V_list': [V.cpu() for V in V_list],
+                            'meta': meta,
+                        }
                     else:
-                        approx_2d = U @ V.T
+                        aad_seed = self.received_vecs.get('aad_seed', self.aad_seed)
+                        if self.use_aad:
+                            layer_seed = stable_layer_seed(aad_seed, item['name'])
+                            U, V = AAD_decomposition(delta_2d, rank, layer_seed, lambda_reg=self.args.als_reg)
+                            U_tilde, V_tilde = generate_aad_basis(
+                                seed=layer_seed,
+                                m=U.shape[0],
+                                n=V.shape[0],
+                                rank=U.shape[1],
+                                device=U.device,
+                            )
+                            approx_2d = U @ V_tilde.T + U_tilde @ V.T
+                            pack_type = 'aad'
+                        else:
+                            U, V = post_hoc_decomposition(delta_2d, rank)
+                            approx_2d = U @ V.T
+                            pack_type = 'svd'
 
-                    approx_layer = (
-                        approx_2d.reshape(orig_shape)
-                        if len(orig_shape) > 2
-                        else approx_2d
-                    )
-                    self.ef_memory[item['name']] = (delta_with_ef - approx_layer).detach().cpu()
+                        approx_layer = (
+                            approx_2d.reshape(orig_shape)
+                            if len(orig_shape) > 2
+                            else approx_2d
+                        )
+                        self.ef_memory[item['name']] = (delta_with_ef - approx_layer).detach().cpu()
+                        compressed[item['name']] = {
+                            'type': pack_type,
+                            'shape': orig_shape,
+                            'U': U.detach().cpu(),
+                            'V': V.detach().cpu(),
+                        }
 
-                    compressed[item['name']] = {
-                        'type': kind,
-                        'shape': orig_shape,
-                        'U': U.detach().cpu(),
-                        'V': V.detach().cpu(),
-                    }
                     done += 1
                 else:
                     compressed[item['name']] = {
                         'type': 'dense',
                         'shape': orig_shape,
-                        'tensor': layer_delta.detach().cpu(),
+                        'tensor': info['delta'].detach().cpu(),
                     }
 
             if getattr(self.args, "verbose", False):

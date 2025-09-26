@@ -17,6 +17,17 @@ print("##=============================================##")
 print("##     Federated Learning Simulator Starts     ##")
 print("##=============================================##")
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        if v.lower() in {"true", "t", "1", "yes", "y"}:
+            return True
+        if v.lower() in {"false", "f", "0", "no", "n"}:
+            return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {v}")
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', choices=['CIFAR10', 'CIFAR100'], type=str, default='CIFAR10')             # select dataset
 parser.add_argument('--model', choices=['LeNet', 'ResNet18'], type=str, default='ResNet18')                # select model
@@ -51,11 +62,19 @@ parser.add_argument('--epsilon', default=0.01, type=float)                      
 
 parser.add_argument('--method', choices=['FedAvg', 'FedCM', 'FedDyn', 'SCAFFOLD', 'FedAdam', 'FedProx', 'FedSAM', 'MoFedSAM', \
                                          'FedGamma', 'FedSpeed', 'FedSMOO'], type=str, default='FedAvg')
-# --- MUD / AAD 配置 ---
-parser.add_argument('--use-mud', action='store_true', default=False,
-                    help='Enable post-hoc low-rank compression (MUD)')
-parser.add_argument('--use-aad', action='store_true', default=False,
-                    help='Use AAD aggregation (requires --use-mud)')
+# --- MUD / AAD / BKD 配置 ---
+parser.add_argument('--use_mud', type=str2bool, default=False,
+                    help='Enable post-hoc compression stack (MUD)')
+parser.add_argument('--aad_pattern', choices=['none', 'svd', 'aad', 'bkd', 'bkd_aad'], type=str, default='none',
+                    help='Select compression/decomposition pattern when MUD is enabled')
+parser.add_argument('--rank', type=int, default=8,
+                    help='Low-rank factorization rank upper bound (per layer)')
+parser.add_argument('--target_cr', type=float, default=0.0,
+                    help='Optional target compression ratio (>=0, 0 disables auto-allocation)')
+parser.add_argument('--kron_blocks', type=int, default=1,
+                    help='Number of Kronecker blocks for BKD (k=1 degenerates to single block)')
+parser.add_argument('--aad_seed', type=int, default=20250105,
+                    help='Global shared seed for AAD basis construction')
 
 # 别名：将 --start-compress-round 映射到 warmup_rounds
 parser.add_argument('--start-compress-round', dest='warmup_rounds', type=int, default=20,
@@ -64,22 +83,28 @@ parser.add_argument('--start-compress-round', dest='warmup_rounds', type=int, de
 parser.add_argument('--compress-freq', dest='compress_every', type=int, default=2,
                     help='Do compression every K rounds (>=1)')
 
-parser.add_argument('--mud-rank', type=int, default=8,
-                    help='Low-rank r upper bound per layer')
 parser.add_argument('--skip-threshold', type=float, default=1e-6,
                     help='Skip layer compression if ||ΔW|| < threshold')
 parser.add_argument('--als-reg', type=float, default=1e-4,
                     help='AAD ridge regularization λ')
-parser.add_argument('--aad-seed', type=int, default=12345,
-                    help='Shared-basis seed for AAD (reproducible)')
-                                         
+
 args = parser.parse_args()
-if args.use_aad and not args.use_mud:
-    print('[warn] --use-aad ignored because --use-mud is not set.')
-    args.use_aad = False
-args.mud_rank = max(0, args.mud_rank)
+args.use_mud = bool(str2bool(args.use_mud) if isinstance(args.use_mud, str) else args.use_mud)
+args.aad_pattern = args.aad_pattern.lower()
+if not args.use_mud and args.aad_pattern != 'none':
+    print('[warn] --aad_pattern ignored because --use_mud is false.')
+    args.aad_pattern = 'none'
+
+args.use_aad = args.aad_pattern in {'aad', 'bkd_aad'}
+args.enable_bkd = args.aad_pattern in {'bkd', 'bkd_aad'}
+
+args.rank = max(0, args.rank)
+args.mud_rank = args.rank  # backward compatibility for existing modules
 args.compress_every = max(1, args.compress_every)
 args.warmup_rounds = max(0, args.warmup_rounds)
+args.target_cr = max(0.0, float(args.target_cr))
+args.kron_blocks = max(1, args.kron_blocks)
+args.aad_seed = int(args.aad_seed)
 print(args)
 
 torch.manual_seed(args.seed)

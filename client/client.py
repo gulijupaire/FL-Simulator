@@ -37,10 +37,12 @@ class Client():
             set_mdl_params(self.model, params_vec)
 
         if self.use_dmu:
-            pack = self.received_vecs.get('global_update_pack')
+            pack = self.received_vecs.get('down_payload_t')
+            if pack is None:
+                pack = self.received_vecs.get('global_update_pack')
             seed_map = self.received_vecs.get('dmu_seed_map')
             apply_flag = bool(self.received_vecs.get('apply_global_update', False))
-            self._apply_global_update_pack(pack, seed_map, apply_flag)
+            self._apply_downlink_payload(pack, seed_map, apply_flag)
             if apply_flag:
                 self.received_vecs['Params_list'] = get_mdl_params(self.model, device=torch.device('cpu'))
 
@@ -50,8 +52,8 @@ class Client():
         
         self.max_norm = 10
 
-    def _apply_global_update_pack(self, pack: Optional[Dict[str, Dict]], seed_map: Optional[Dict[str, int]],
-                                  apply_flag: bool) -> None:
+    def _apply_downlink_payload(self, pack: Optional[Dict[str, Dict]], seed_map: Optional[Dict[str, int]],
+                                apply_flag: bool) -> None:
         if not apply_flag or not pack:
             if apply_flag:
                 # Even if pack is missing, keep deterministic seeds in sync.
